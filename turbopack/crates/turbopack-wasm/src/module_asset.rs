@@ -191,15 +191,15 @@ impl ChunkItem for ModuleChunkItem {
         self.module.ident()
     }
 
-    #[turbo_tasks::function]
-    fn references(&self) -> Vc<ModuleReferences> {
-        let loader = self
-            .module
-            .loader()
-            .as_chunk_item(Vc::upcast(*self.chunking_context));
+    // #[turbo_tasks::function]
+    // fn references(&self) -> Vc<OutputAssets> {
+    // let loader = self
+    //     .module
+    //     .loader()
+    //     .as_chunk_item(Vc::upcast(*self.chunking_context));
 
-        loader.references()
-    }
+    // loader.references()
+    // }
 
     #[turbo_tasks::function]
     fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {

@@ -41,12 +41,8 @@ pub use self::{
     evaluate::{EvaluatableAsset, EvaluatableAssetExt, EvaluatableAssets},
 };
 use crate::{
-    asset::Asset,
-    environment::ChunkLoading,
-    ident::AssetIdent,
-    module::Module,
-    output::OutputAssets,
-    reference::{ModuleReference, ModuleReferences},
+    asset::Asset, environment::ChunkLoading, ident::AssetIdent, module::Module,
+    output::OutputAssets, reference::ModuleReference,
 };
 
 /// A module id, which can be a number or string
@@ -361,13 +357,15 @@ async fn graph_node_to_referenced_nodes(
     node: ChunkGraphNodeToReferences,
     chunking_context: Vc<Box<dyn ChunkingContext>>,
 ) -> Result<Vc<ChunkGraphEdges>> {
-    let (parent, references) = match &node {
-        ChunkGraphNodeToReferences::PassthroughChunkItem(item) => (None, item.references()),
-        ChunkGraphNodeToReferences::ChunkItem(item) => (Some(*item), item.references()),
+    let (parent, module_references) = match &node {
+        ChunkGraphNodeToReferences::PassthroughChunkItem(item) => {
+            (None, item.module().references())
+        }
+        ChunkGraphNodeToReferences::ChunkItem(item) => (Some(*item), item.module().references()),
     };
 
-    let references = references.await?;
-    let graph_nodes = references
+    let module_references = module_references.await?;
+    let graph_nodes = module_references
         .iter()
         .map(|reference| async {
             let reference = *reference;
@@ -732,11 +730,10 @@ pub trait ChunkItem {
     fn content_ident(self: Vc<Self>) -> Vc<AssetIdent> {
         self.asset_ident()
     }
-    /// A [ChunkItem] can describe different `references` than its original
-    /// [Module].
-    /// TODO(alexkirsz) This should have a default impl that returns empty
-    /// references.
-    fn references(self: Vc<Self>) -> Vc<ModuleReferences>;
+    /// A [ChunkItem] can reference OutputAssets, unlike [Module]s referencing other [Module]s.
+    fn references(self: Vc<Self>) -> Vc<OutputAssets> {
+        OutputAssets::empty()
+    }
 
     /// The type of chunk this item should be assembled into.
     fn ty(self: Vc<Self>) -> Vc<Box<dyn ChunkType>>;
