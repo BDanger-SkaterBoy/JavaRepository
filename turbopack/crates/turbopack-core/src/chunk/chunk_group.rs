@@ -141,11 +141,13 @@ pub async fn make_chunk_group(
         .map(|&loader| loader.references())
         .try_join()
         .await?;
-    let async_loader_external_module_references = async_loader_references
-        .iter()
-        .flat_map(|references| references.iter().copied())
-        .map(|v| *v)
-        .collect();
+    let async_loader_external_module_references = OutputAssets::new(
+        async_loader_references
+            .iter()
+            .flat_map(|references| references.iter().copied())
+            .map(|v| *v)
+            .collect(),
+    );
 
     let mut referenced_output_assets = references_to_output_assets(external_module_references)
         .await?
@@ -185,7 +187,7 @@ pub async fn make_chunk_group(
             chunking_context,
             Vc::cell(async_loader_chunk_items.into_iter().collect()),
             "async-loader-".into(),
-            references_to_output_assets(async_loader_external_module_references).await?,
+            async_loader_external_module_references,
         )
         .await?;
 
