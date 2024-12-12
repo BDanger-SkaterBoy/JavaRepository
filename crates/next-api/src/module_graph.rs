@@ -17,7 +17,7 @@ use next_core::{
 };
 use petgraph::{
     graph::{DiGraph, NodeIndex},
-    visit::{Dfs, VisitMap, Visitable},
+    visit::{Dfs, EdgeRef, VisitMap, Visitable},
 };
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -29,19 +29,29 @@ use turbo_tasks::{
     CollectiblesSource, FxIndexMap, FxIndexSet, NonLocalValue, ReadRef, ResolvedVc,
     TryFlatJoinIterExt, TryJoinIterExt, ValueToString, Vc,
 };
+use turbo_tasks_hash::hash_xxh3_hash64;
 use turbopack_core::{
-    chunk::ChunkingType,
+    chunk::{module_id_strategies::GlobalModuleIdStrategy, ChunkingType},
     context::AssetContext,
+    ident::AssetIdent,
     issue::{Issue, IssueExt},
     module::{Module, Modules},
     reference::primary_chunkable_referenced_modules,
+};
+use turbopack_ecmascript::{
+    async_chunk::module::async_loader_modifier,
+    global_module_id_strategy::merge_preprocessed_module_ids,
 };
 
 use crate::{
     client_references::{map_client_references, ClientReferenceMapType, ClientReferencesSet},
     dynamic_imports::{map_next_dynamic, DynamicImports},
     project::Project,
-    server_actions::{map_server_actions, to_rsc_context, AllActions, AllModuleActions},
+    route::{AppPageRoute, Route},
+    server_actions::{
+        map_server_actions, server_actions_loader_modifier, to_rsc_context, AllActions,
+        AllModuleActions,
+    },
 };
 
 #[turbo_tasks::value(transparent)]
@@ -466,6 +476,45 @@ impl SingleModuleGraph {
         Ok(())
     }
 
+    /// Traverses all edges exactly once and calls the visitor with the edge source and
+    /// target.
+    ///
+    /// This means that target nodes can be revisited (once per incoming edge).
+    pub fn traverse_edges<'a>(
+        &'a self,
+        mut visitor: impl FnMut(
+            (
+                Option<(&'a SingleModuleGraphNode, &'a ChunkingType)>,
+                &'a SingleModuleGraphNode,
+            ),
+        ) -> GraphTraversalAction,
+    ) -> Result<()> {
+        let graph = &self.graph;
+        let mut stack = self.entries.values().copied().collect::<Vec<_>>();
+        let mut discovered = graph.visit_map();
+        for entry_node in self.entries.values() {
+            let entry_weight = graph.node_weight(*entry_node).unwrap();
+            visitor((None, entry_weight));
+        }
+
+        while let Some(node) = stack.pop() {
+            let node_weight = graph.node_weight(node).unwrap();
+            if discovered.visit(node) {
+                for edge in graph.edges(node).collect::<Vec<_>>() {
+                    let edge_weight = edge.weight();
+                    let succ = edge.target();
+                    let succ_weight = graph.node_weight(succ).unwrap();
+                    let action = visitor((Some((node_weight, edge_weight)), succ_weight));
+                    if !discovered.is_visited(&succ) && action == GraphTraversalAction::Continue {
+                        stack.push(succ);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Traverses all reachable edges in topological order. The preorder visitor can be used to
     /// forward state down the graph, and to skip subgraphs
     ///
@@ -613,6 +662,11 @@ async fn get_module_graph_for_endpoint(
     graphs.push(graph);
 
     Ok(Vc::cell(graphs))
+}
+
+#[turbo_tasks::function]
+async fn get_module_graph_for_project(project: ResolvedVc<Project>) -> Vc<SingleModuleGraph> {
+    SingleModuleGraph::new_with_entries(project.get_all_entries())
 }
 
 #[turbo_tasks::value]
@@ -1062,13 +1116,9 @@ async fn get_reduced_graphs_for_endpoint_inner(
         NextMode::Build => (
             false,
             vec![
-                async move {
-                    SingleModuleGraph::new_with_entries(project.get_all_entries())
-                        .to_resolved()
-                        .await
-                }
-                .instrument(tracing::info_span!("module graph for app"))
-                .await?,
+                async move { get_module_graph_for_project(project).to_resolved().await }
+                    .instrument(tracing::info_span!("module graph for app"))
+                    .await?,
             ],
         ),
     };
@@ -1136,4 +1186,86 @@ pub async fn get_reduced_graphs_for_endpoint(
         let _issues = result.take_collectibles::<Box<dyn Issue>>();
     }
     Ok(result)
+}
+
+/// Like get_reduced_graphs_for_endpoint, but may only be called for builds
+///
+/// If you can, use get_reduced_graphs_for_endpoint instead.
+#[turbo_tasks::function]
+pub async fn get_global_module_id_strategy(
+    project: Vc<Project>,
+) -> Result<Vc<GlobalModuleIdStrategy>> {
+    let graph_op = get_module_graph_for_project(project);
+    // TODO get rid of this function once everything inside of
+    // `get_reduced_graphs_for_endpoint_inner` calls `take_collectibles()` when needed
+    let graph = graph_op.strongly_consistent().await?;
+    let _ = graph_op.take_collectibles::<Box<dyn Issue>>();
+
+    let mut additional_idents = vec![];
+    {
+        // This is a hack for the action loader modules that are currently created ad-hoc in
+        // AppEndpoint (and not part of the module graph). Changint that is difficult because this
+        // module is created with information from the single module graph
+        /*
+        [project]/test/e2e/app-dir/app-a11y/.next-internal/server/app/page-with-h1/page/actions.js [app-rsc] (server-actions-loader, ecmascript)
+        */
+        let rsc_layer = Vc::cell("app-rsc".into());
+        let ecmascript = Vc::cell("ecmascript".into());
+        let server_action_loader_ident = |page_name: &str| {
+            let path = project
+                .project_path()
+                .join(format!(".next-internal/server/app{page_name}/actions.js").into());
+            AssetIdent::from_path(path)
+                .with_layer(rsc_layer)
+                .with_modifier(server_actions_loader_modifier())
+                .with_modifier(ecmascript)
+        };
+        for (_, route) in project.entrypoints().await?.routes.iter() {
+            match route {
+                Route::AppPage(page_routes) => {
+                    for AppPageRoute { original_name, .. } in page_routes {
+                        additional_idents.push(server_action_loader_ident(original_name));
+                    }
+                }
+                Route::AppRoute { original_name, .. } => {
+                    additional_idents.push(server_action_loader_ident(original_name));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut idents = additional_idents;
+    idents.extend(graph.iter_nodes().map(|node| node.module.ident()));
+
+    // Add all the modules that are inserted by chunking (i.e. async loaders)
+    graph.traverse_edges(|(parent, current)| {
+        if let Some((_, &ChunkingType::Async)) = parent {
+            idents.push(
+                current
+                    .module
+                    .ident()
+                    .with_modifier(async_loader_modifier()),
+            );
+        }
+        GraphTraversalAction::Continue
+    })?;
+
+    let module_id_map = idents
+        .into_iter()
+        .map(|ident| ident.to_string())
+        .try_join()
+        .await?
+        .iter()
+        .map(|module_ident| {
+            let ident_str = module_ident.clone_value();
+            let hash = hash_xxh3_hash64(&ident_str);
+            (ident_str, hash)
+        })
+        .collect();
+
+    // TODO clean up this call signature
+    let module_id_map = merge_preprocessed_module_ids(vec![Vc::cell(module_id_map)]).await?;
+
+    GlobalModuleIdStrategy::new(module_id_map).await
 }
