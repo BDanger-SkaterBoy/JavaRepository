@@ -2,7 +2,7 @@ import type {
   CacheNodeSeedData,
   FlightRouterState,
   InitialRSCPayload,
-  Segment,
+  Segment as FlightRouterStateSegment,
 } from './types'
 import type { ManifestNode } from '../../build/webpack/plugins/flight-manifest-plugin'
 
@@ -15,9 +15,9 @@ import {
   streamFromBuffer,
   streamToBuffer,
 } from '../stream-utils/node-web-streams-helper'
-import { UNDERSCORE_NOT_FOUND_ROUTE } from '../../api/constants'
 import { waitAtLeastOneReactRenderTask } from '../../lib/scheduler'
 import type { LoadingModuleData } from '../../shared/lib/app-router-context.shared-runtime'
+import { encodeSegment, encodeSlot } from './segment-value-encoding'
 
 // Contains metadata about the route tree. The client must fetch this before
 // it can fetch any actual segment data.
@@ -36,12 +36,8 @@ export type TreePrefetch = {
   // order to get the access token.
   token: string
 
-  // The path to use when requesting the data for this segment (analogous to a
-  // URL). Also used as a cache key, although the server may specify a different
-  // cache key when it responds (analagous to a Vary header), like to omit
-  // params if they aren't used to compute the response. (This part not
-  // yet implemented)
-  path: string
+  // The segment, in the format expected by a FlightRouterState.
+  segment: FlightRouterStateSegment
 
   // Child segments.
   slots: null | {
@@ -53,7 +49,7 @@ export type TreePrefetch = {
   // after some refactoring, but in the meantime it would be wasteful to add a
   // bunch of new prefetch-only fields to FlightRouterState. So think of
   // TreePrefetch as a superset of FlightRouterState.
-  extra: [segment: Segment, isRootLayout: boolean]
+  isRootLayout: boolean
 }
 
 export type SegmentPrefetch = {
@@ -220,7 +216,7 @@ async function collectSegmentDataImpl(
   fullPageDataBuffer: Buffer,
   clientModules: ManifestNode,
   serverConsumerManifest: any,
-  segmentPathStr: string,
+  key: string,
   accessToken: string,
   segmentTasks: Array<Promise<[string, Buffer]>>
 ): Promise<TreePrefetch> {
@@ -235,14 +231,11 @@ async function collectSegmentDataImpl(
     const childSegment = childRoute[0]
     const childSeedData =
       seedDataChildren !== null ? seedDataChildren[parallelRouteKey] : null
-    const childSegmentPathStr =
-      segmentPathStr +
-      '/' +
-      encodeChildSegmentAsFilesystemSafePathname(parallelRouteKey, childSegment)
-
+    const childKey =
+      key + '/' + encodeSlot(parallelRouteKey, encodeSegment(childSegment))
     // Create an access token for each child slot.
     const childAccessToken = await createSegmentAccessToken(
-      segmentPathStr,
+      key,
       parallelRouteKey
     )
     const childTree = await collectSegmentDataImpl(
@@ -252,7 +245,7 @@ async function collectSegmentDataImpl(
       fullPageDataBuffer,
       clientModules,
       serverConsumerManifest,
-      childSegmentPathStr,
+      childKey,
       childAccessToken,
       segmentTasks
     )
@@ -271,7 +264,7 @@ async function collectSegmentDataImpl(
         renderSegmentPrefetch(
           buildId,
           seedData,
-          segmentPathStr,
+          key,
           accessToken,
           clientModules
         )
@@ -287,20 +280,18 @@ async function collectSegmentDataImpl(
 
   // Metadata about the segment. Sent to the client as part of the
   // tree prefetch.
-  const segment = route[0]
-  const isRootLayout = route[4]
   return {
-    path: segmentPathStr === '' ? '/' : segmentPathStr,
+    segment: route[0],
     token: accessToken,
     slots: slotMetadata,
-    extra: [segment, isRootLayout === true],
+    isRootLayout: route[4] === true,
   }
 }
 
 async function renderSegmentPrefetch(
   buildId: string,
   seedData: CacheNodeSeedData,
-  segmentPathStr: string,
+  key: string,
   accessToken: string,
   clientModules: ManifestNode
 ): Promise<[string, Buffer]> {
@@ -333,7 +324,7 @@ async function renderSegmentPrefetch(
   )
   const segmentBuffer = await streamToBuffer(segmentStream)
   // Add the buffer to the result map.
-  if (segmentPathStr === '') {
+  if (key === '') {
     return ['/', segmentBuffer]
   } else {
     // The access token is appended to the end of the segment name. To request
@@ -343,7 +334,7 @@ async function renderSegmentPrefetch(
     //
     // The segment path is provided by the tree prefetch, and the access
     // token is provided in the parent layout's data.
-    const fullPath = `${segmentPathStr}.${accessToken}`
+    const fullPath = `${key}.${accessToken}`
     return [fullPath, segmentBuffer]
   }
 }
@@ -370,86 +361,6 @@ async function isPartialRSCData(
     onError() {},
   })
   return isPartial
-}
-
-// TODO: Consider updating or unifying this encoding logic for segments with
-// createRouterCacheKey on the client, perhaps by including it as part of
-// the FlightRouterState. Theoretically the client should never have to do its
-// own encoding of segment keys; it can pass back whatever the server gave it.
-function encodeChildSegmentAsFilesystemSafePathname(
-  parallelRouteKey: string,
-  segment: Segment
-): string {
-  // Encode a child segment and its corresponding parallel route key to a
-  // filesystem-safe pathname. The format is internal-only and can be somewhat
-  // arbitrary as long as there are no collisions, because these will be used
-  // as filenames during build and in the incremental cache. They will also
-  // be sent by the client to request the corresponding segment, but they
-  // do not need to be decodable. The server will merely look for a matching
-  // file in the cache.
-  //
-  // For ease of debugging, the format looks roughly similar to the App Router
-  // convention for defining routes in the source, but again the exact format is
-  // not important as long as it's consistent between the client and server and
-  // meets the above requirements.
-  //
-  // TODO: If the segment did not read from params, then we can omit the
-  // params from the cache key. Need to track this during the prerender somehow.
-  let safeSegmentValue
-  if (typeof segment === 'string') {
-    safeSegmentValue = encodeParamValue(segment)
-  } else {
-    // Parameterized segments.
-    const [paramName, paramValue, paramType] = segment
-    let paramPrefix
-    switch (paramType) {
-      case 'c':
-      case 'ci':
-        paramPrefix = `[...${paramName}]`
-        break
-      case 'oc':
-        paramPrefix = `[[...${paramName}]]`
-        break
-      case 'd':
-      case 'di':
-        paramPrefix = `[${paramName}]`
-        break
-      default:
-        throw new Error('Unknown dynamic param type')
-    }
-    safeSegmentValue = `${paramPrefix}-${encodeParamValue(paramValue)}`
-  }
-  let result
-  if (parallelRouteKey === 'children') {
-    // Omit the parallel route key for children, since this is the most
-    // common case. Saves some bytes.
-    result = `${safeSegmentValue}`
-  } else {
-    result = `@${parallelRouteKey}/${safeSegmentValue}`
-  }
-  return result
-}
-
-// Define a regex pattern to match the most common characters found in a route
-// param. It excludes anything that might not be cross-platform filesystem
-// compatible, like |. It does not need to be precise because the fallback is to
-// just base64url-encode the whole parameter, which is fine; we just don't do it
-// by default for compactness, and for easier debugging.
-const simpleParamValueRegex = /^[a-zA-Z0-9\-_@]+$/
-
-function encodeParamValue(segment: string): string {
-  if (segment === UNDERSCORE_NOT_FOUND_ROUTE) {
-    // TODO: FlightRouterState encodes Not Found routes as "/_not-found". But
-    // params typically don't include the leading slash. We should use a
-    // different encoding to avoid this special case.
-    return '_not-found'
-  }
-  if (simpleParamValueRegex.test(segment)) {
-    return segment
-  }
-  // If there are any unsafe characters, base64url-encode the entire segment.
-  // We also add a $ prefix so it doesn't collide with the simple case.
-  return '$' + Buffer.from(segment, 'utf-8').toString('base64url')
 }
 
 async function createSegmentAccessToken(
