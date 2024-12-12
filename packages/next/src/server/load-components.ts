@@ -32,6 +32,7 @@ import { setReferenceManifestsSingleton } from './app-render/encryption-utils'
 import { createServerModuleMap } from './app-render/action-utils'
 import type { DeepReadonly } from '../shared/lib/deep-readonly'
 import { isMetadataRoute } from '../lib/metadata/is-metadata-route'
+import { normalizePagePath } from '../shared/lib/page-path/normalize-page-path'
 
 export type ManifestItem = {
   id: number | string
@@ -98,6 +99,19 @@ export async function loadManifestWithRetries<T extends object>(
 }
 
 /**
+ * Load manifest file with retries, defaults to 3 attempts, or return undefined.
+ */
+export async function tryLoadManifestWithRetries<T extends object>(
+  manifestPath: string
+) {
+  try {
+    return await loadManifestWithRetries<T>(manifestPath)
+  } catch (err) {
+    return undefined
+  }
+}
+
+/**
  * Load manifest file with retries, defaults to 3 attempts.
  */
 export async function evalManifestWithRetries<T extends object>(
@@ -116,7 +130,7 @@ export async function evalManifestWithRetries<T extends object>(
   }
 }
 
-async function loadClientReferenceManifest(
+async function tryLoadClientReferenceManifest(
   manifestPath: string,
   entryName: string
 ) {
@@ -151,7 +165,32 @@ async function loadComponentsImpl<N = any>({
   // Make sure to avoid loading the manifest for metadata route handlers.
   const hasClientManifest = isAppPath && !isMetadataRoute(page)
 
+  let reactLoadableManifestPath
+  if (!process.env.TURBOPACK) {
+    reactLoadableManifestPath = join(distDir, REACT_LOADABLE_MANIFEST)
+  } else if (isAppPath) {
+    reactLoadableManifestPath = join(
+      distDir,
+      'server',
+      'app',
+      page,
+      REACT_LOADABLE_MANIFEST
+    )
+  } else {
+    reactLoadableManifestPath = join(
+      distDir,
+      'server',
+      'pages',
+      normalizePagePath(page),
+      REACT_LOADABLE_MANIFEST
+    )
+  }
+
   // Load the manifest files first
+  //
+  // Loading page-specific manifests shouldn't throw an error if the manifest couldn't be found, so
+  // that the `requirePage` call below will throw the correct error in that case
+  // (a `PageNotFoundError`).
   const [
     buildManifest,
     reactLoadableManifest,
@@ -160,8 +199,8 @@ async function loadComponentsImpl<N = any>({
     serverActionsManifest,
   ] = await Promise.all([
     loadManifestWithRetries<BuildManifest>(join(distDir, BUILD_MANIFEST)),
-    loadManifestWithRetries<ReactLoadableManifest>(
-      join(distDir, REACT_LOADABLE_MANIFEST)
+    tryLoadManifestWithRetries<ReactLoadableManifest>(
+      reactLoadableManifestPath
     ),
     // This manifest will only exist in Pages dir && Production && Webpack.
     isAppPath || process.env.TURBOPACK
@@ -170,7 +209,7 @@ async function loadComponentsImpl<N = any>({
           join(distDir, `${DYNAMIC_CSS_MANIFEST}.json`)
         ).catch(() => undefined),
     hasClientManifest
-      ? loadClientReferenceManifest(
+      ? tryLoadClientReferenceManifest(
           join(
             distDir,
             'server',
@@ -215,7 +254,7 @@ async function loadComponentsImpl<N = any>({
     Document,
     Component,
     buildManifest,
-    reactLoadableManifest,
+    reactLoadableManifest: reactLoadableManifest || {},
     dynamicCssManifest,
     pageConfig: ComponentMod.config || {},
     ComponentMod,
